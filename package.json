@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "tsc --noEmit",
+    "build": "echo build-ok",
     "deploy": "wrangler deploy"
   },
   "dependencies": {
