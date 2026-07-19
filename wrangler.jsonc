@@ -1,0 +1,13 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "dexcom-cgm-mcp",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-19",
+
+  "kv_namespaces": [
+    {
+      "binding": "DEXCOM_TOKENS",
+      "id": "8559ea7f9d124f69b9a21685c202929c"
+    }
+  ]
+}
