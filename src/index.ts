@@ -11,6 +11,13 @@ type Env = {
   DEXCOM_TOKENS: KVNamespace;
 };
 
+interface DexcomTokenResponse {
+  access_token: string;
+  refresh_token?: string;
+  expires_in?: number;
+  token_type?: string;
+}
+
 const BASES: Record<string, string> = {
   sandbox: "https://sandbox-api.dexcom.com",
   production_us: "https://api.dexcom.com",
@@ -24,6 +31,15 @@ function getBase(env: Env) {
   return BASES[env.DEXCOM_ENV || "sandbox"] || BASES.sandbox;
 }
 
+function timingSafeEqual(a: string, b: string) {
+  if (a.length !== b.length) return false;
+  let result = 0;
+  for (let i = 0; i < a.length; i++) {
+    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return result === 0;
+}
+
 function requireAuth(request: Request, env: Env) {
   const expected = env.MCP_API_KEY;
   const auth = request.headers.get("authorization") || "";
@@ -32,7 +48,23 @@ function requireAuth(request: Request, env: Env) {
     return new Response("Missing MCP_API_KEY server secret", { status: 500 });
   }
 
-  if (auth !== `Bearer ${expected}`) {
+  if (!timingSafeEqual(auth, `Bearer ${expected}`)) {
+    return new Response("Unauthorized", { status: 401 });
+  }
+
+  return null;
+}
+
+function requireAdminKey(url: URL, env: Env) {
+  const expected = env.MCP_API_KEY;
+
+  if (!expected) {
+    return new Response("Missing MCP_API_KEY server secret", { status: 500 });
+  }
+
+  const key = url.searchParams.get("key") || "";
+
+  if (!timingSafeEqual(key, expected)) {
     return new Response("Unauthorized", { status: 401 });
   }
 
@@ -164,17 +196,31 @@ export default {
     }
 
     if (url.pathname === "/oauth/start") {
+      const authError = requireAdminKey(url, env);
+      if (authError) return authError;
+
+      const state = crypto.randomUUID();
+      await env.DEXCOM_TOKENS.put(`oauth_state:${state}`, "1", { expirationTtl: 600 });
+
       const auth = new URL(`${base}/v3/oauth2/login`);
       auth.searchParams.set("client_id", env.DEXCOM_CLIENT_ID);
       auth.searchParams.set("redirect_uri", env.DEXCOM_REDIRECT_URI);
       auth.searchParams.set("response_type", "code");
       auth.searchParams.set("scope", "offline_access");
+      auth.searchParams.set("state", state);
       return Response.redirect(auth.toString(), 302);
     }
 
     if (url.pathname === "/oauth/callback") {
       const code = url.searchParams.get("code");
-      if (!code) return json({ error: "missing_code" }, 400);
+      const state = url.searchParams.get("state");
+
+      if (!code || !state) return json({ error: "missing_code_or_state" }, 400);
+
+      const stateKey = `oauth_state:${state}`;
+      const validState = await env.DEXCOM_TOKENS.get(stateKey);
+      if (!validState) return json({ error: "invalid_or_expired_state" }, 400);
+      await env.DEXCOM_TOKENS.delete(stateKey);
 
       const token = await exchangeCodeForToken(base, env, code);
       await saveToken(env, token);
@@ -271,7 +317,7 @@ function formatDexcomDate(date: Date) {
   return date.toISOString().replace(/\.\d{3}Z$/, "");
 }
 
-async function exchangeCodeForToken(base: string, env: Env, code: string) {
+async function exchangeCodeForToken(base: string, env: Env, code: string): Promise<DexcomTokenResponse> {
   const body = new URLSearchParams();
   body.set("grant_type", "authorization_code");
   body.set("code", code);
@@ -289,10 +335,10 @@ async function exchangeCodeForToken(base: string, env: Env, code: string) {
     throw new Error(`token_exchange_failed_${res.status}: ${await res.text()}`);
   }
 
-  return res.json();
+  return res.json() as Promise<DexcomTokenResponse>;
 }
 
-async function refreshAccessToken(base: string, env: Env, refreshToken: string) {
+async function refreshAccessToken(base: string, env: Env, refreshToken: string): Promise<DexcomTokenResponse> {
   const body = new URLSearchParams();
   body.set("grant_type", "refresh_token");
   body.set("refresh_token", refreshToken);
@@ -309,10 +355,10 @@ async function refreshAccessToken(base: string, env: Env, refreshToken: string) 
     throw new Error(`token_refresh_failed_${res.status}: ${await res.text()}`);
   }
 
-  return res.json();
+  return res.json() as Promise<DexcomTokenResponse>;
 }
 
-async function saveToken(env: Env, token: any) {
+async function saveToken(env: Env, token: DexcomTokenResponse) {
   const now = Math.floor(Date.now() / 1000);
   const existingRaw = await env.DEXCOM_TOKENS.get("dexcom_token");
   const existing = existingRaw ? JSON.parse(existingRaw) : {};
@@ -337,6 +383,10 @@ async function getValidAccessToken(base: string, env: Env) {
 
   if (saved.access_token && saved.expires_at && saved.expires_at > now + 120) {
     return saved.access_token;
+  }
+
+  if (!saved.refresh_token) {
+    throw new Error("dexcom_missing_refresh_token_reconnect_via_/oauth/start");
   }
 
   const refreshed = await refreshAccessToken(base, env, saved.refresh_token);
