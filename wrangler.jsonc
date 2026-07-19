@@ -3,6 +3,7 @@
   "name": "dexcom-cgm-mcp",
   "main": "src/index.ts",
   "compatibility_date": "2026-07-19",
+  "compatibility_flags": ["nodejs_compat"],
 
   "kv_namespaces": [
     {
