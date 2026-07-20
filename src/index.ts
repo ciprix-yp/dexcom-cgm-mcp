@@ -71,6 +71,49 @@ function requireAdminKey(url: URL, env: Env) {
   return null;
 }
 
+const STATE_MAX_AGE_MS = 10 * 60 * 1000;
+
+async function hmacSign(data: string, secret: string) {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(data));
+  return btoa(String.fromCharCode(...new Uint8Array(sig)))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+async function createSignedState(env: Env) {
+  const nonce = crypto.randomUUID();
+  const timestamp = Date.now();
+  const payload = `${nonce}.${timestamp}`;
+  const signature = await hmacSign(payload, env.MCP_API_KEY);
+  return `${payload}.${signature}`;
+}
+
+async function verifySignedState(state: string, env: Env) {
+  const parts = state.split(".");
+  if (parts.length !== 3) return false;
+
+  const [nonce, timestampStr, signature] = parts;
+  const payload = `${nonce}.${timestampStr}`;
+  const expectedSignature = await hmacSign(payload, env.MCP_API_KEY);
+
+  if (!timingSafeEqual(signature, expectedSignature)) return false;
+
+  const timestamp = Number(timestampStr);
+  if (!Number.isFinite(timestamp)) return false;
+
+  const age = Date.now() - timestamp;
+  return age >= 0 && age <= STATE_MAX_AGE_MS;
+}
+
 export class DexcomMcpAgent extends McpAgent<Env> {
   server = new McpServer({
     name: "dexcom-cgm-mcp",
@@ -199,8 +242,7 @@ export default {
       const authError = requireAdminKey(url, env);
       if (authError) return authError;
 
-      const state = crypto.randomUUID();
-      await env.DEXCOM_TOKENS.put(`oauth_state:${state}`, "1", { expirationTtl: 600 });
+      const state = await createSignedState(env);
 
       const auth = new URL(`${base}/v3/oauth2/login`);
       auth.searchParams.set("client_id", env.DEXCOM_CLIENT_ID);
@@ -217,10 +259,8 @@ export default {
 
       if (!code || !state) return json({ error: "missing_code_or_state" }, 400);
 
-      const stateKey = `oauth_state:${state}`;
-      const validState = await env.DEXCOM_TOKENS.get(stateKey);
+      const validState = await verifySignedState(state, env);
       if (!validState) return json({ error: "invalid_or_expired_state" }, 400);
-      await env.DEXCOM_TOKENS.delete(stateKey);
 
       const token = await exchangeCodeForToken(base, env, code);
       await saveToken(env, token);
