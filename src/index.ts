@@ -9,6 +9,7 @@ type Env = {
   DEXCOM_ENV?: string;
   MCP_API_KEY: string;
   DEXCOM_TOKENS: KVNamespace;
+  DEXCOM_MCP_OBJECT: DurableObjectNamespace<DexcomMcpAgent>;
 };
 
 interface DexcomTokenResponse {
@@ -270,18 +271,18 @@ export default {
       });
     }
 
-    if (url.pathname.startsWith("/sse") || url.pathname.startsWith("/message")) {
+    if (url.pathname.startsWith("/mcp")) {
       const authError = requireAuth(request, env);
       if (authError) return authError;
 
-      return DexcomMcpAgent.serveSSE("/sse").fetch(request, env, ctx);
+      return DexcomMcpAgent.serve("/mcp", { transport: "auto" }).fetch(request, env, ctx);
     }
 
     if (url.pathname === "/") {
       return json({
         name: "Dexcom CGM MCP Bridge",
         status: "ok",
-        mcp_server_url: `${url.origin}/sse`,
+        mcp_server_url: `${url.origin}/mcp`,
       });
     }
 
@@ -429,14 +430,29 @@ async function getValidAccessToken(base: string, env: Env) {
     throw new Error("dexcom_missing_refresh_token_reconnect_via_/oauth/start");
   }
 
-  const refreshed = await refreshAccessToken(base, env, saved.refresh_token);
-  await saveToken(env, {
-    ...refreshed,
-    refresh_token: refreshed.refresh_token || saved.refresh_token,
-  });
+  try {
+    const refreshed = await refreshAccessToken(base, env, saved.refresh_token);
+    await saveToken(env, {
+      ...refreshed,
+      refresh_token: refreshed.refresh_token || saved.refresh_token,
+    });
 
-  const raw2 = await env.DEXCOM_TOKENS.get("dexcom_token");
-  return JSON.parse(raw2!).access_token;
+    const raw2 = await env.DEXCOM_TOKENS.get("dexcom_token");
+    return JSON.parse(raw2!).access_token;
+  } catch (err) {
+    // Dexcom refresh_tokens are single-use. If two calls raced to refresh at
+    // once, this one may have lost the race. Check whether a concurrent
+    // request already wrote a fresh, still-valid token before giving up.
+    const raw2 = await env.DEXCOM_TOKENS.get("dexcom_token");
+    if (raw2) {
+      const saved2 = JSON.parse(raw2);
+      const now2 = Math.floor(Date.now() / 1000);
+      if (saved2.access_token && saved2.expires_at && saved2.expires_at > now2 + 60) {
+        return saved2.access_token;
+      }
+    }
+    throw err;
+  }
 }
 
 function textResult(data: unknown) {
