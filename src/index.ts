@@ -8,6 +8,7 @@ type Env = {
   DEXCOM_REDIRECT_URI: string;
   DEXCOM_ENV?: string;
   MCP_API_KEY: string;
+  INTERNAL_SYNC_KEY: string;
   DEXCOM_TOKENS: KVNamespace;
   DEXCOM_MCP_OBJECT: DurableObjectNamespace<DexcomMcpAgent>;
 };
@@ -269,6 +270,21 @@ export default {
       return new Response("Dexcom connected. You can close this tab.", {
         headers: { "content-type": "text/plain; charset=utf-8" },
       });
+    }
+
+    if (url.pathname === "/internal/egvs") {
+      if (!timingSafeEqual(request.headers.get("x-internal-key") ?? "", env.INTERNAL_SYNC_KEY)) {
+        return new Response("unauthorized", { status: 401 });
+      }
+      const start = url.searchParams.get("start");
+      const end = url.searchParams.get("end");
+      if (!start || !end) return new Response("missing start/end", { status: 400 });
+      try {
+        const data = await dexcomWindowData(getBase(env), env, "egvs", start, end);
+        return Response.json(data);
+      } catch (err) {
+        return json({ error: String(err instanceof Error ? err.message : err) }, 502);
+      }
     }
 
     if (url.pathname.startsWith("/mcp")) {
