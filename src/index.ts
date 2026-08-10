@@ -1,6 +1,7 @@
 import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { shareGetGlucoseReadings } from "./share-client";
 
 type Env = {
   DEXCOM_CLIENT_ID: string;
@@ -11,6 +12,12 @@ type Env = {
   INTERNAL_SYNC_KEY: string;
   DEXCOM_TOKENS: KVNamespace;
   DEXCOM_MCP_OBJECT: DurableObjectNamespace<DexcomMcpAgent>;
+  // Dexcom Share API (neoficial) -- vezi share-client.ts. Folosit acum de /internal/egvs în
+  // locul fluxului OAuth v3 (rămas mai jos, neșters, dar dormant -- automatizarea de
+  // sandbox-consent a Dexcom e blocată intern, fără termen de reparare, 2026-08-10).
+  DEXCOM_SHARE_USERNAME?: string;
+  DEXCOM_SHARE_PASSWORD?: string;
+  DEXCOM_SHARE_REGION?: string;
 };
 
 interface DexcomTokenResponse {
@@ -237,6 +244,8 @@ export default {
         hasRedirectUri: Boolean(env.DEXCOM_REDIRECT_URI),
         hasKvBinding: Boolean(env.DEXCOM_TOKENS),
         hasMcpApiKey: Boolean(env.MCP_API_KEY),
+        hasShareCredentials: Boolean(env.DEXCOM_SHARE_USERNAME && env.DEXCOM_SHARE_PASSWORD),
+        shareRegion: env.DEXCOM_SHARE_REGION || "ous",
       });
     }
 
@@ -280,7 +289,7 @@ export default {
       const end = url.searchParams.get("end");
       if (!start || !end) return new Response("missing start/end", { status: 400 });
       try {
-        const data = await dexcomWindowData(getBase(env), env, "egvs", start, end);
+        const data = await shareWindowData(env, start, end);
         return Response.json(data);
       } catch (err) {
         return json({ error: String(err instanceof Error ? err.message : err) }, 502);
@@ -333,6 +342,39 @@ async function dexcomWindowData(
   });
 
   return readDexcomJson(res);
+}
+
+const SHARE_MAX_MINUTES = 1440; // cap hard Share API (~24h), vezi share-client.ts
+
+// Share API nu ia start/end arbitrar -- ia doar "ultimele N minute de acum" (max 1440). Traducem
+// contractul existent (start/end, moștenit de la fluxul OAuth v3) cerând ultimele
+// minutesSince(start) minute (rotunjite în sus, capate la 1440) și filtrând local la fereastra
+// exactă cerută -- apelantul (job-ul de gap-fill din repo-ul principal) trebuie să nu ceară
+// niciodată o fereastră mai veche de ~24h; altfel Share API pur și simplu n-are de unde întoarce
+// date, indiferent cum tratăm noi cererea.
+async function shareWindowData(env: Env, startDate: string, endDate: string) {
+  validateDateWindowOrThrow(startDate, endDate);
+
+  const start = new Date(addZIfMissing(startDate));
+  const end = new Date(addZIfMissing(endDate));
+  const now = new Date();
+
+  const minutesSinceStart = Math.ceil((now.getTime() - start.getTime()) / 60000);
+  if (minutesSinceStart > SHARE_MAX_MINUTES) {
+    throw new Error(
+      `share_window_too_old: fereastra cerută începe cu ${Math.round(minutesSinceStart / 60)}h în urmă, ` +
+        `Share API acoperă doar ultimele ${SHARE_MAX_MINUTES / 60}h`
+    );
+  }
+
+  const readings = await shareGetGlucoseReadings(env, Math.max(minutesSinceStart, 1));
+
+  const filtered = readings.filter((r) => {
+    const t = new Date(r.systemTime).getTime();
+    return t >= start.getTime() && t < end.getTime();
+  });
+
+  return { recordType: "egv", recordVersion: "3.0", records: filtered };
 }
 
 function validateDateWindowOrThrow(startDate: string, endDate: string) {
